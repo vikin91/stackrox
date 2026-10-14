@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -354,6 +355,60 @@ func (s *nodeIndexerSuite) TestExtractHostname() {
 				s.NoError(err)
 				s.Equal(tc.expected, got)
 			}
+		})
+	}
+}
+
+func (s *nodeIndexerSuite) TestRepositoryScannerMappingRetries() {
+	tcs := map[string]struct {
+		status    int
+		failures  int32
+		wantCalls int32
+		timeout   time.Duration
+		wantError bool
+	}{
+		"recovers after three failures": {
+			status: http.StatusServiceUnavailable, failures: 3, wantCalls: 4,
+		},
+		"stops after three retries": {
+			status: http.StatusServiceUnavailable, failures: 4, wantCalls: 4, wantError: true,
+		},
+		"does not retry permanent errors": {
+			status: http.StatusNotFound, failures: 1, wantCalls: 1, wantError: true,
+		},
+		"timeout stops retries": {
+			status: http.StatusServiceUnavailable, failures: 4, wantCalls: 1,
+			timeout: 100 * time.Millisecond, wantError: true,
+		},
+	}
+	for name, tc := range tcs {
+		s.Run(name, func() {
+			var calls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if calls.Add(1) <= tc.failures {
+					w.WriteHeader(tc.status)
+					return
+				}
+				_, err := w.Write([]byte(`{"data":{
+					"rhocp-4.16-for-rhel-9-x86_64-rpms":{"cpes":["cpe:/a:redhat:openshift:4.16::el9"]},
+					"rhel-9-for-x86_64-baseos-eus-rpms__9_DOT_4":{"cpes":["cpe:/o:redhat:rhel_eus:9.4::baseos"]}
+				}}`))
+				s.NoError(err)
+			}))
+			s.T().Cleanup(server.Close)
+			cfg := createConfig("testdata", server.Client(), server.URL)
+			if tc.timeout != 0 {
+				cfg.Timeout = tc.timeout
+			}
+			l := s.mustCreateLayer(cfg.HostPath)
+			repos, err := runRepositoryScanner(s.T().Context(), cfg, l)
+			s.Equal(tc.wantCalls, calls.Load())
+			if tc.wantError {
+				s.Error(err)
+				return
+			}
+			s.Require().NoError(err)
+			s.Len(repos, 2)
 		})
 	}
 }
